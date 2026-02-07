@@ -1,0 +1,144 @@
+"""
+Plot CSDI Wave Results - PRES REMOVED VERSION
+==============================================
+"""
+import argparse
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import pickle
+import pandas as pd
+import os
+
+# Updated feature names (8 features, PRES excluded)
+FEATURE_NAMES_PLOT = [
+    'WDIR (deg)', 'WSPD (m/s)', 'WVHT (m)', 'DPD (sec)', 
+    'APD (sec)', 'MWD (deg)', 'ATMP (°C)', 'DEWP (°C)'
+]
+
+def get_quantile(samples, q, dim=1):
+    return torch.quantile(samples, q, dim=dim).cpu().numpy()
+
+def plot_wave_results(folder_path=None, sample_idx=0, nsample=100, task="imputation"):
+    if folder_path is None:
+        save_dir = "./save/"
+        if not os.path.exists(save_dir):
+             print(f"Directory {save_dir} does not exist.")
+             return
+        list_subfolders = [f.path for f in os.scandir(save_dir) if f.is_dir()]
+        
+        # Filter for relevant folders
+        if task == "forecasting":
+            wave_folders = [f for f in list_subfolders if "forecast" in f]
+        else:
+            wave_folders = [f for f in list_subfolders if "imputation" in f]
+            
+        if not wave_folders:
+            # Fallback: look at all folders if specific match fails
+            wave_folders = list_subfolders
+        
+        if not wave_folders:
+            print("No results found in ./save/")
+            return
+
+        # Get the most recent folder
+        folder_path = max(wave_folders, key=os.path.getctime)
+        print(f"Auto-detected: {folder_path}")
+    
+    # Try to find the results file
+    results_file = os.path.join(folder_path, f"generated_outputs_nsample{nsample}.pk")
+    print(f"Loading: {results_file}")
+    
+    if not os.path.exists(results_file):
+        print(f"File not found. Searching folder for any .pk file...")
+        files = [f for f in os.listdir(folder_path) if f.endswith('.pk') and 'generated_outputs' in f]
+        if files:
+            results_file = os.path.join(folder_path, files[0])
+            print(f"Found alternative: {results_file}")
+        else:
+            print("No generated output files found.")
+            return
+
+    with open(results_file, 'rb') as f:
+        data = pickle.load(f)
+        # Unpack robustly (handles 7 or more items)
+        samples, all_target, all_evalpoint, all_observed, all_observed_time, scaler, mean_scaler = data[:7]
+
+    all_target_np = all_target.cpu().numpy()
+    all_evalpoint_np = all_evalpoint.cpu().numpy()
+    all_observed_np = all_observed.cpu().numpy()
+    all_given_np = all_observed_np * (1.0 - all_evalpoint_np)
+    
+    K = all_target_np.shape[-1]
+    
+    # Select feature names
+    if K == 8:
+        feature_names = FEATURE_NAMES_PLOT
+    else:
+        feature_names = [f"Feature {i}" for i in range(K)]
+
+    # Un-normalize
+    if torch.is_tensor(scaler): scaler = scaler.cpu().numpy()
+    if torch.is_tensor(mean_scaler): mean_scaler = mean_scaler.cpu().numpy()
+    
+    all_target_unnorm = all_target_np * scaler + mean_scaler
+    
+    if torch.is_tensor(samples):
+        scaler_t = torch.tensor(scaler, device=samples.device)
+        mean_t = torch.tensor(mean_scaler, device=samples.device)
+        samples = samples * scaler_t + mean_t
+    
+    L = samples.shape[-2]
+    
+    # Calculate Quantiles
+    qlist = [0.05, 0.25, 0.5, 0.75, 0.95]
+    quantiles_imp = []
+    for q in qlist:
+        q_sample = get_quantile(samples, q, dim=1)
+        combined = q_sample * (1 - all_given_np) + all_target_unnorm * all_given_np
+        quantiles_imp.append(combined)
+
+    # PLOTTING
+    nrows, ncols = 2, 4
+    fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(16, 8))
+    axes = axes.flatten()
+    
+    # Ensure sample_idx is valid
+    if sample_idx >= len(all_target_np):
+        sample_idx = 0
+
+    for k in range(K):
+        ax = axes[k]
+        
+        # Forecast (Green)
+        ax.plot(range(L), quantiles_imp[2][sample_idx, :, k], color='g', label='Forecast')
+        ax.fill_between(range(L), quantiles_imp[0][sample_idx, :, k], quantiles_imp[4][sample_idx, :, k], color='g', alpha=0.3)
+
+        # Truth (Blue Dots)
+        ax.plot(range(L), all_target_unnorm[sample_idx, :, k], 'bo', markersize=3, label='Truth')
+        
+        # Context (Red Crosses)
+        given_idx = np.where(all_given_np[sample_idx, :, k] == 1)[0]
+        ax.plot(given_idx, all_target_unnorm[sample_idx, given_idx, k], 'rx', markersize=4, label='Context')
+        
+        ax.set_title(feature_names[k] if k < len(feature_names) else f"Feat {k}")
+        ax.grid(True, alpha=0.3)
+
+    # Cleanup
+    for k in range(K, len(axes)): axes[k].axis('off')
+    
+    plt.tight_layout()
+    save_path = os.path.join(folder_path, f"plot_sample{sample_idx}.png")
+    plt.savefig(save_path)
+    print(f"Saved Plot: {save_path}")
+    plt.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--folder", type=str, default=None)
+    parser.add_argument("--sample", type=int, default=0)
+    parser.add_argument("--task", type=str, default="forecasting")
+    parser.add_argument("--nsample", type=int, default=100)
+    args = parser.parse_args()
+
+    plot_wave_results(folder_path=args.folder, sample_idx=args.sample, nsample=args.nsample, task=args.task)

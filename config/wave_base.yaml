@@ -1,0 +1,86 @@
+# CSDI v2 Configuration for Wave Height Forecasting
+# =================================================
+# 
+# This configuration is optimized for NDBC buoy data forecasting
+# with optional ERA5 spatial covariate integration.
+#
+# Key changes from v1:
+# - Deterministic temporal splits (Train: ≤2022, Val: 2023, Test: 2024+)
+# - Multi-horizon support (6h, 24h, 48h, 72h)
+# - ERA5 integration options
+# - Enhanced evaluation metrics
+
+# Training Configuration
+train:
+  epochs: 20
+  batch_size: 16
+  lr: 0.001
+  itr_per_epoch: 100
+
+# Diffusion Model Configuration
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: "quad"  # "quad" or "linear"
+  is_linear: false  # Use standard transformer (false) or linear attention (true)
+
+# Model Configuration
+model:
+  is_unconditional: false
+  timeemb: 128
+  featureemb: 16
+  target_strategy: "mix"  # "mix", "random", or "historical"
+  cfg_dropout_prob: 0.0   # Classifier-free guidance dropout (0 = disabled)
+  cfg_scale: 1.0          # CFG scale at inference (1.0 = no guidance)
+
+# Dataset Configuration (for reference, actual values set in exe_wave.py)
+dataset:
+  type: "NDBC1"           # NDBC1 (10-min) or NDBC2 (hourly)
+  station: "42001"        # Gulf of Mexico buoy
+  features:
+    - "WDIR"   # Wind Direction
+    - "WSPD"   # Wind Speed
+    - "WVHT"   # Significant Wave Height (Primary Target)
+    - "DPD"    # Dominant Period
+    - "APD"    # Average Period
+    - "MWD"    # Mean Wave Direction
+    - "PRES"   # Atmospheric Pressure
+    - "ATMP"   # Air Temperature
+    - "DEWP"   # Dew Point
+
+# Forecasting Configuration
+forecasting:
+  context_hours: 72       # 72h context window (432 steps at 10-min)
+  horizons:               # Standard forecast horizons
+    - 6                   # 6h ahead (36 steps)
+    - 24                  # 24h ahead (144 steps)
+    - 48                  # 48h ahead (288 steps)
+    - 72                  # 72h ahead (432 steps)
+
+# ERA5 Configuration (optional)
+era5:
+  enabled: false
+  context_hours: 24       # ERA5 context window in hours
+  spatial_window_deg: 3.0 # Spatial window size (3° or 5°)
+  variables:
+    - "u10"               # 10m U wind component
+    - "v10"               # 10m V wind component
+    - "msl"               # Mean sea level pressure
+  encoder:
+    in_channels: 3
+    hidden_channels: 64
+    out_dim: 128
+    num_blocks: 2
+
+# Temporal Split Configuration (Deterministic)
+# NOTE: These are enforced in dataset_wave.py, not configurable
+temporal_splits:
+  train_end: "2022-12-31"
+  val_start: "2023-01-01"
+  val_end: "2023-12-31"
+  test_start: "2024-01-01"

@@ -1,0 +1,6 @@
+save/
+*.pk
+*.pth
+__pycache__/
+*.log
+.env
