@@ -17,6 +17,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, List, Dict, Union
 import warnings
+import math
 
 # ============================================================================
 # CONSTANTS
@@ -25,6 +26,10 @@ import warnings
 FEATURE_NAMES = ['WDIR', 'WSPD', 'WVHT', 'DPD', 'APD', 'MWD', 'PRES', 'ATMP', 'DEWP']
 TARGET_DIM = len(FEATURE_NAMES)
 WVHT_INDEX = FEATURE_NAMES.index('WVHT')  # Index 2
+
+# Circular variables (degrees, wrap at 360)
+CIRCULAR_VARS = ['WDIR', 'MWD']
+CIRCULAR_INDICES = [FEATURE_NAMES.index(v) for v in CIRCULAR_VARS]
 
 MINUTES_PER_STEP = 10
 STEPS_PER_HOUR = 60 // MINUTES_PER_STEP
@@ -57,6 +62,27 @@ TEST_START_DATE = datetime(2024, 1, 1, 0, 0, 0)
 ERA5_VARIABLES = ['u10', 'v10', 'msl']
 ERA5_RESOLUTION = 0.25
 
+
+# ============================================================================
+# CIRCULAR ENCODING/DECODING UTILITIES
+# ============================================================================
+
+def encode_circular(degrees: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Encode degrees to (sin, cos) representation."""
+    radians = np.deg2rad(degrees)
+    return np.sin(radians), np.cos(radians)
+
+def decode_circular(sin_vals: np.ndarray, cos_vals: np.ndarray) -> np.ndarray:
+    """Decode (sin, cos) back to degrees [0, 360)."""
+    radians = np.arctan2(sin_vals, cos_vals)
+    degrees = np.rad2deg(radians)
+    degrees = np.mod(degrees, 360.0)
+    return degrees
+
+def angular_error(pred_deg: np.ndarray, true_deg: np.ndarray) -> np.ndarray:
+    """Compute angular error in degrees (handles wrap-around)."""
+    diff = np.abs(pred_deg - true_deg)
+    return np.minimum(diff, 360.0 - diff)
 
 # ============================================================================
 # UTILITY FUNCTIONS
@@ -122,6 +148,29 @@ class Wave_Dataset(Dataset):
             self.observed_mask = data_dict['observed_mask']
             self.train_mean = data_dict['train_mean']
             self.train_std = data_dict['train_std']
+            
+            # Handle circular encoding metadata
+            self.use_circular_encoding = data_dict.get('use_circular_encoding', False)
+            # DEBUG: Print what we loaded
+            print(f"\n[DEBUG] Loading data for {self.mode}:")
+            print(f"  File loaded: {'imputed' if imputed_file.exists() else 'processed'}")
+            print(f"  Data shape: {self.main_data.shape}")
+            print(f"  use_circular_encoding in file: {data_dict.get('use_circular_encoding', 'NOT FOUND')}")
+            print(f"  feature_names in file: {data_dict.get('feature_names', 'NOT FOUND')}")
+            print(f"  expanded_feature_names in file: {data_dict.get('expanded_feature_names', 'NOT FOUND')}")
+        
+
+            self.original_feature_names = data_dict.get('feature_names', FEATURE_NAMES)
+            self.expanded_feature_names = data_dict.get('expanded_feature_names', self.original_feature_names)
+            self.circular_var_map = data_dict.get('circular_var_map', {})
+            self.feature_to_expanded = data_dict.get('feature_to_expanded', {})
+            
+            # Update target_dim if using circular encoding
+            if self.use_circular_encoding:
+                self.target_dim = len(self.expanded_feature_names)
+            else:
+                self.target_dim = len(self.original_feature_names)
+            
             if 'timestamps' in data_dict:
                 self.timestamps = data_dict['timestamps']
             else:
@@ -130,6 +179,14 @@ class Wave_Dataset(Dataset):
                     start_date + timedelta(minutes=i * (60 // self.steps_per_hour))
                     for i in range(len(self.observed_data))
                 ])
+        
+        # Debug: Print feature info
+        print(f"\nDataset loaded: {self.mode}")
+        print(f"  Original features: {len(self.original_feature_names)}")
+        print(f"  Expanded features: {len(self.expanded_feature_names)}")
+        print(f"  Circular encoding: {self.use_circular_encoding}")
+        if self.use_circular_encoding:
+            print(f"  Circular vars: {[k for k in self.circular_var_map.keys()]}")
     
     def _create_deterministic_splits(self):
         train_end_idx = datetime_to_index(self.timestamps, TRAIN_END_DATE)
@@ -204,13 +261,18 @@ class Wave_Dataset_Forecasting(Dataset):
         imputed_file = self.data_path / f"{self.dataset_type}_{self.station}_imputed.pk"
         processed_file = self.data_path / f"{self.dataset_type}_{self.station}_processed.pk"
         
+        # DEBUG: Check which file exists and will be loaded
+        file_loaded = None
         if imputed_file.exists():
+            print(f"[WARNING] Imputed file exists: {imputed_file}")
+            print(f"  This will be loaded instead of processed file (may not have circular encoding metadata)")
             with open(imputed_file, "rb") as f:
                 data_dict = pickle.load(f)
                 self.main_data = data_dict['imputed_data']
                 self.mask_data = np.ones_like(self.main_data)
                 self.train_mean = data_dict['train_mean']
                 self.train_std = data_dict['train_std']
+                file_loaded = "imputed"
         elif processed_file.exists():
             with open(processed_file, "rb") as f:
                 data_dict = pickle.load(f)
@@ -218,8 +280,32 @@ class Wave_Dataset_Forecasting(Dataset):
                 self.mask_data = data_dict['observed_mask']
                 self.train_mean = data_dict['train_mean']
                 self.train_std = data_dict['train_std']
+                file_loaded = "processed"
         else:
             raise FileNotFoundError(f"No data found at {self.data_path}")
+        
+        # Handle circular encoding metadata
+        self.use_circular_encoding = data_dict.get('use_circular_encoding', False)
+        self.original_feature_names = data_dict.get('feature_names', FEATURE_NAMES)
+        self.expanded_feature_names = data_dict.get('expanded_feature_names', self.original_feature_names)
+        self.circular_var_map = data_dict.get('circular_var_map', {})
+        self.feature_to_expanded = data_dict.get('feature_to_expanded', {})
+        
+        # DEBUG: Print what was loaded
+        print(f"\n[DEBUG {self.mode}] Data loading:")
+        print(f"  File loaded: {file_loaded}")
+        print(f"  Data shape: {self.main_data.shape}")
+        print(f"  use_circular_encoding in file: {data_dict.get('use_circular_encoding', 'NOT FOUND')}")
+        if 'expanded_feature_names' in data_dict:
+            print(f"  expanded_feature_names count: {len(data_dict['expanded_feature_names'])}")
+        print(f"  Final use_circular_encoding: {self.use_circular_encoding}")
+        print(f"  Final target_dim: {len(self.expanded_feature_names) if self.use_circular_encoding else len(self.original_feature_names)}")
+        
+        # Update target_dim if using circular encoding
+        if self.use_circular_encoding:
+            self.target_dim = len(self.expanded_feature_names)
+        else:
+            self.target_dim = len(self.original_feature_names)
         
         if 'timestamps' in data_dict:
             self.timestamps = pd.to_datetime(data_dict['timestamps'])
@@ -252,16 +338,69 @@ class Wave_Dataset_Forecasting(Dataset):
         ])
         
         print(f"{self.mode.upper()} (42002 Optimized): {len(self.use_index)} valid samples")
+        
+        # TASK 4: Sanity prints for dataset configuration
+        print(f"\n{'='*60}")
+        print(f"DATASET CONFIGURATION: {self.mode.upper()}")
+        print(f"{'='*60}")
+        print(f"  dataset_type: {self.dataset_type}")
+        print(f"  steps_per_hour: {self.steps_per_hour}")
+        print(f"  context_steps: {self.context_steps}")
+        print(f"  horizon_steps: {self.horizon_steps}")
+        print(f"  seq_length: {self.seq_length}")
+        print(f"  timestamps range: {self.timestamps[0]} to {self.timestamps[-1]}")
+        print(f"  num_samples: {len(self.use_index)}")
+        print(f"  target_dim: {self.target_dim}")
+        print(f"  use_circular_encoding: {self.use_circular_encoding}")
+        if self.use_circular_encoding:
+            print(f"  expanded_features: {len(self.expanded_feature_names)}")
+        print(f"{'='*60}\n")
     
     def __getitem__(self, org_index: int) -> Dict[str, np.ndarray]:
         index = self.use_index[org_index]
         data = self.main_data[index:index + self.seq_length].copy()
         mask = self.mask_data[index:index + self.seq_length].copy()
         
+        # Initialize gt_mask: context is observed (conditioning), horizon is masked
         gt_mask = np.zeros_like(mask)
         gt_mask[:self.context_steps] = mask[:self.context_steps]
         
+        # TASK 2: Only predict WVHT in forecast horizon (not all variables)
+        # Derive WVHT index safely (handles circular encoding)
+        if self.use_circular_encoding:
+            # With circular encoding, find WVHT in expanded feature names
+            if 'WVHT' in self.feature_to_expanded:
+                wvht_idx = self.feature_to_expanded['WVHT'][0]
+            else:
+                # Fallback: count position accounting for circular vars
+                wvht_idx = 0
+                for feat_name in self.expanded_feature_names:
+                    if feat_name == 'WVHT':
+                        break
+                    wvht_idx += 1
+                # Safety check
+                if wvht_idx >= len(self.expanded_feature_names):
+                    raise ValueError(f"WVHT not found in expanded features: {self.expanded_feature_names}")
+        else:
+            # Without circular encoding, use original feature index
+            wvht_idx = self.original_feature_names.index('WVHT')
+        
+        # observed_mask: only WVHT is observed in horizon (for scoring), all others masked
         observed_mask = mask.copy()
+        observed_mask[self.context_steps:, :] = 0.0  # Mask all variables in horizon
+        observed_mask[self.context_steps:, wvht_idx] = mask[self.context_steps:, wvht_idx]  # Unmask WVHT in horizon
+        
+        # DEBUG: Verify masks are correct (only print once per dataset)
+        if not hasattr(self, '_mask_debug_printed'):
+            print(f"\n[DEBUG {self.mode}] Mask verification (first sample):")
+            print(f"  gt_mask context sum: {gt_mask[:self.context_steps].sum():.0f}")
+            print(f"  gt_mask horizon sum: {gt_mask[self.context_steps:].sum():.0f} (should be ~0)")
+            print(f"  observed_mask context sum: {observed_mask[:self.context_steps].sum():.0f}")
+            print(f"  observed_mask horizon sum: {observed_mask[self.context_steps:].sum():.0f}")
+            print(f"  observed_mask horizon WVHT sum: {observed_mask[self.context_steps:, wvht_idx].sum():.0f}")
+            print(f"  WVHT index: {wvht_idx}")
+            self._mask_debug_printed = True
+        
         timepoints = np.arange(self.seq_length).astype(np.float32)
         
         return {
@@ -323,6 +462,20 @@ class Wave_Dataset_ERA5_Forecasting(Dataset):
         else: raise FileNotFoundError(f"No buoy data found at {self.data_path}")
         self.train_mean = data_dict['train_mean']
         self.train_std = data_dict['train_std']
+        
+        # Handle circular encoding metadata
+        self.use_circular_encoding = data_dict.get('use_circular_encoding', False)
+        self.original_feature_names = data_dict.get('feature_names', FEATURE_NAMES)
+        self.expanded_feature_names = data_dict.get('expanded_feature_names', self.original_feature_names)
+        self.circular_var_map = data_dict.get('circular_var_map', {})
+        self.feature_to_expanded = data_dict.get('feature_to_expanded', {})
+        
+        # Update target_dim if using circular encoding
+        if self.use_circular_encoding:
+            self.target_dim = len(self.expanded_feature_names)
+        else:
+            self.target_dim = len(self.original_feature_names)
+        
         if 'timestamps' in data_dict: self.timestamps = pd.to_datetime(data_dict['timestamps'])
         else: self.timestamps = pd.date_range(datetime(2010,1,1), periods=len(self.buoy_data), freq=f"{60//self.steps_per_hour}min")
 
@@ -429,7 +582,13 @@ def get_dataloader(datatype="NDBC1", device='cuda:0', batch_size=16, station="42
     mean_scaler = torch.from_numpy(train_dataset.train_mean).to(device).float()
     return train_loader, valid_loader, test_loader, scaler, mean_scaler
 
-def preprocess_wave_data(raw_file, output_path, dataset_type="NDBC1", station="42001"):
+def preprocess_wave_data(raw_file, output_path, dataset_type="NDBC1", station="42001", use_circular_encoding=True):
+    """
+    Preprocess NDBC data with optional circular encoding for WDIR/MWD.
+    
+    Args:
+        use_circular_encoding: If True, encode WDIR/MWD as (sin, cos) pairs
+    """
     warnings.filterwarnings('ignore')
     output_path = Path(output_path)
     output_path.mkdir(parents=True, exist_ok=True)
@@ -443,8 +602,29 @@ def preprocess_wave_data(raw_file, output_path, dataset_type="NDBC1", station="4
     else: raise ValueError(f"Cannot identify time columns")
     year_values = df[year_col].values
     if year_values.max() < 100: year_values = np.where(year_values < 50, year_values + 2000, year_values + 1900)
-    df['datetime'] = pd.to_datetime({'year': year_values, 'month': df[time_cols[1]], 'day': df[time_cols[2]], 'hour': df[time_cols[3]], 'minute': df[time_cols[4]]})
-    df.set_index('datetime', inplace=True); df.sort_index(inplace=True)
+    
+    # TASK 1: Robust datetime parsing with error handling
+    df['datetime'] = pd.to_datetime({
+        'year': year_values, 
+        'month': df[time_cols[1]], 
+        'day': df[time_cols[2]], 
+        'hour': df[time_cols[3]], 
+        'minute': df[time_cols[4]]
+    }, errors='coerce')
+    
+    # Drop rows with NaT timestamps
+    initial_len = len(df)
+    df = df.dropna(subset=['datetime'])
+    dropped_len = initial_len - len(df)
+    if dropped_len > 0:
+        print(f"WARNING: Dropped {dropped_len} rows with invalid timestamps (NaT)")
+    
+    df.set_index('datetime', inplace=True)
+    df.sort_index(inplace=True)
+    
+    # Assert no NaT in index
+    assert not df.index.isna().any(), "Index contains NaT values after cleaning!"
+    
     print(f"Date range: {df.index[0]} to {df.index[-1]}")
     column_mapping = {'BAR': 'PRES'}; 
     for old_name, new_name in column_mapping.items(): 
@@ -452,30 +632,163 @@ def preprocess_wave_data(raw_file, output_path, dataset_type="NDBC1", station="4
     available_features = [f for f in FEATURE_NAMES if f in df.columns]
     if 'WVHT' not in available_features: raise ValueError("WVHT column not found!")
     print(f"Selected features ({len(available_features)}): {available_features}")
+    
     df = df[available_features]
     for col in available_features: df[col] = pd.to_numeric(df[col], errors='coerce')
     df = df.replace({99: np.nan, 99.0: np.nan, 999: np.nan, 9999: np.nan})
+    
+    # Check for DEWP (after converting to numeric and cleaning)
+    if 'DEWP' not in available_features:
+        print("WARNING: DEWP not found in raw data!")
+    else:
+        dewp_data = df['DEWP'].values
+        # Ensure numeric type (already numpy array from .values)
+        dewp_data = np.array(dewp_data, dtype=float)
+        dewp_valid = ~np.isnan(dewp_data)
+        if dewp_valid.any():
+            print(f"DEWP: {dewp_valid.sum()}/{len(dewp_data)} valid values, "
+                  f"std={np.nanstd(dewp_data):.4f}, mean={np.nanmean(dewp_data):.4f}")
+        else:
+            print(f"DEWP: {dewp_valid.sum()}/{len(dewp_data)} valid values (ALL MISSING!)")
     for col in available_features:
-        if col in ['WVHT', 'DPD', 'APD', 'WSPD', 'ATMP', 'DEWP']: df.loc[df[col] >= 99, col] = np.nan
-        elif col in ['WDIR', 'MWD']: df.loc[df[col] > 360, col] = np.nan
-        elif col == 'PRES': df.loc[(df[col] > 1100) | (df[col] < 900), col] = np.nan
+        if col in ['WVHT', 'DPD', 'APD', 'WSPD', 'ATMP', 'DEWP']: 
+            df.loc[df[col] >= 99, col] = np.nan
+        elif col in ['WDIR', 'MWD']: 
+            df.loc[df[col] > 360, col] = np.nan
+        elif col == 'PRES': 
+            df.loc[(df[col] > 1100) | (df[col] < 900), col] = np.nan
+    
     data = df.values
+    # Ensure data is numeric and handle NaN properly
+    data = np.array(data, dtype=float)
     mask = (~np.isnan(data)).astype(float)
     timestamps = df.index.values
     train_end_idx = datetime_to_index(timestamps, TRAIN_END_DATE)
     train_data = data[:train_end_idx]
-    train_mean = np.nanmean(train_data, axis=0)
-    train_std = np.nanstd(train_data, axis=0)
-    data = np.nan_to_num(data, nan=0.0)
-    normalized_data = (data - train_mean) / train_std
-    normalized_data = normalized_data * mask
-    processed_file = output_path / f"{dataset_type}_{station}_processed.pk"
-    with open(processed_file, 'wb') as f:
-        pickle.dump({'observed_data': normalized_data, 'observed_mask': mask, 'train_mean': train_mean, 'train_std': train_std, 'feature_names': available_features, 'timestamps': timestamps}, f)
-    meanstd_file = output_path / f"{dataset_type}_{station}_meanstd.pk"
-    with open(meanstd_file, 'wb') as f: pickle.dump([train_mean, train_std], f)
-    print(f"Processed data saved to {processed_file}")
-    return normalized_data, mask, train_mean, train_std
+    
+    # Handle circular encoding
+    if use_circular_encoding:
+        # Build expanded feature list: replace circular vars with sin/cos
+        expanded_feature_names = []
+        circular_var_map = {}  # Maps original index -> (sin_idx, cos_idx)
+        feature_to_expanded = {}  # Maps original feature name -> expanded indices
+        
+        for i, feat_name in enumerate(FEATURE_NAMES):
+            if feat_name in available_features:
+                orig_idx = available_features.index(feat_name)
+                if feat_name in CIRCULAR_VARS:
+                    sin_idx = len(expanded_feature_names)
+                    cos_idx = sin_idx + 1
+                    expanded_feature_names.extend([f"{feat_name}_sin", f"{feat_name}_cos"])
+                    circular_var_map[orig_idx] = (sin_idx, cos_idx)
+                    feature_to_expanded[feat_name] = (sin_idx, cos_idx)
+                else:
+                    expanded_feature_names.append(feat_name)
+                    feature_to_expanded[feat_name] = (len(expanded_feature_names) - 1,)
+        
+        # Encode circular variables
+        expanded_data = []
+        expanded_mask = []
+        
+        for i, feat_name in enumerate(FEATURE_NAMES):
+            if feat_name in available_features:
+                orig_idx = available_features.index(feat_name)
+                col_data = data[:, orig_idx]
+                col_mask = mask[:, orig_idx]
+                
+                if feat_name in CIRCULAR_VARS:
+                    # Encode as sin/cos
+                    # Ensure col_data is numeric
+                    col_data = np.array(col_data, dtype=float)
+                    valid_mask = ~np.isnan(col_data)
+                    sin_vals = np.full(len(col_data), 0.0)
+                    cos_vals = np.full(len(col_data), 0.0)
+                    
+                    if valid_mask.any():
+                        sin_vals[valid_mask], cos_vals[valid_mask] = encode_circular(col_data[valid_mask])
+                    
+                    expanded_data.append(sin_vals)
+                    expanded_data.append(cos_vals)
+                    expanded_mask.append(col_mask)  # Same mask for both
+                    expanded_mask.append(col_mask)
+                else:
+                    expanded_data.append(col_data)
+                    expanded_mask.append(col_mask)
+        
+        expanded_data = np.column_stack(expanded_data)
+        expanded_mask = np.column_stack(expanded_mask)
+        
+        # Compute stats on expanded features
+        train_expanded = expanded_data[:train_end_idx]
+        train_mean = np.nanmean(train_expanded, axis=0)
+        train_std = np.nanstd(train_expanded, axis=0)
+        
+        # FIX: Handle NaNs in Mean/Std safely
+        # If a column is entirely empty, mean/std will be NaN. Fill them with defaults.
+        train_mean = np.nan_to_num(train_mean, nan=0.0)
+        train_std = np.nan_to_num(train_std, nan=1.0)
+        
+        # Also prevent division by zero for constant columns
+        train_std = np.where(train_std < 1e-6, 1.0, train_std)
+        
+        # Normalize
+        # Replace NaNs in data with 0.0 BEFORE normalization
+        expanded_data = np.nan_to_num(expanded_data, nan=0.0)
+        
+        normalized_data = (expanded_data - train_mean) / train_std
+        
+        # Apply mask
+        normalized_data = normalized_data * expanded_mask
+        
+        # FIX: Final Safety Clean
+        # Ensure no NaNs exist in the final normalized data (e.g., from NaN * 0)
+        normalized_data = np.nan_to_num(normalized_data, nan=0.0)
+        
+        # Save with circular encoding metadata
+        processed_file = output_path / f"{dataset_type}_{station}_processed.pk"
+        with open(processed_file, 'wb') as f:
+            pickle.dump({
+                'observed_data': normalized_data,
+                'observed_mask': expanded_mask,
+                'train_mean': train_mean,
+                'train_std': train_std,
+                'feature_names': available_features,  # Original names
+                'expanded_feature_names': expanded_feature_names,  # Expanded names
+                'circular_var_map': circular_var_map,
+                'feature_to_expanded': feature_to_expanded,
+                'use_circular_encoding': True,
+                'timestamps': timestamps
+            }, f)
+        
+        print(f"Processed data with circular encoding saved to {processed_file}")
+        print(f"Expanded features: {len(expanded_feature_names)} (from {len(available_features)})")
+        print(f"Circular variables encoded: {[f for f in CIRCULAR_VARS if f in available_features]}")
+        
+        return normalized_data, expanded_mask, train_mean, train_std
+        
+    else:
+        # Original non-circular encoding
+        train_mean = np.nanmean(train_data, axis=0)
+        train_std = np.nanstd(train_data, axis=0)
+        train_std = np.where(train_std < 1e-6, 1.0, train_std)
+        
+        data = np.nan_to_num(data, nan=0.0)
+        normalized_data = (data - train_mean) / train_std
+        normalized_data = normalized_data * mask
+        
+        processed_file = output_path / f"{dataset_type}_{station}_processed.pk"
+        with open(processed_file, 'wb') as f:
+            pickle.dump({
+                'observed_data': normalized_data,
+                'observed_mask': mask,
+                'train_mean': train_mean,
+                'train_std': train_std,
+                'feature_names': available_features,
+                'use_circular_encoding': False,
+                'timestamps': timestamps
+            }, f)
+        print(f"Processed data saved to {processed_file}")
+        return normalized_data, mask, train_mean, train_std
 
 if __name__ == "__main__":
     print("Testing Wave_Dataset_Forecasting...")

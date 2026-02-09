@@ -38,6 +38,21 @@ model:
   cfg_dropout_prob: 0.0   # Classifier-free guidance dropout (0 = disabled)
   cfg_scale: 1.0          # CFG scale at inference (1.0 = no guidance)
 
+# Conditioning Schedule Configuration
+conditioning:
+  type: "none"  # "exp", "linear", or "none" (none = disabled)
+  alpha: 1.0    # Initial scale for exponential decay
+  beta: 0.1     # Decay rate for exponential decay
+  min: 0.2      # Minimum scale value
+
+# Loss Weighting Configuration
+loss:
+  use_weights: false  # Enable per-variable loss weighting
+  weight_map:
+    WVHT: 5.0  # Weight for WVHT (primary target)
+    WDIR: 1.0
+    MWD: 1.0
+
 # Dataset Configuration (for reference, actual values set in exe_wave.py)
 dataset:
   type: "NDBC1"           # NDBC1 (10-min) or NDBC2 (hourly)

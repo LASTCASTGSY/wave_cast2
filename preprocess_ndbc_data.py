@@ -46,6 +46,11 @@ def main():
         default="42001",
         help="Buoy station IDs, comma separated (e.g. '42001,42020,42035')"
     )
+    parser.add_argument(
+        "--use_circular_encoding",
+        action="store_true",
+        help="Encode WDIR/MWD as (sin, cos) pairs (recommended)"
+    )
     
     args = parser.parse_args()
     
@@ -88,7 +93,8 @@ def main():
                 raw_file=str(input_file),
                 output_path=args.output,
                 dataset_type=args.dataset_type,
-                station=station_id
+                station=station_id,
+                use_circular_encoding=args.use_circular_encoding
             )
             print(f"  [SUCCESS] {station_id} processed.")
             success_count += 1

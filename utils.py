@@ -45,6 +45,7 @@ from datetime import datetime
 
 FEATURE_NAMES = ['WDIR', 'WSPD', 'WVHT', 'DPD', 'APD', 'MWD', 'PRES', 'ATMP', 'DEWP']
 WVHT_INDEX = FEATURE_NAMES.index('WVHT')
+CIRCULAR_VARS = ['WDIR', 'MWD']
 
 
 # ============================================================================
@@ -262,33 +263,62 @@ def calc_per_variable_metrics(
     eval_points: torch.Tensor,
     mean_scaler: torch.Tensor,
     scaler: torch.Tensor,
-    feature_names: List[str] = FEATURE_NAMES
+    feature_names: List[str] = FEATURE_NAMES,
+    use_circular_encoding: bool = False,
+    feature_to_expanded: Optional[Dict] = None,
+    debug: bool = False
 ) -> Dict[str, Dict[str, float]]:
     """
     Calculate RMSE and MAE per variable (un-normalized).
+    Handles circular variables if use_circular_encoding=True.
     """
     pred_median = samples.median(dim=1).values
     
+    # Unnormalize everything first (this might be memory intensive but ensures consistency)
     target_unnorm = target * scaler + mean_scaler
     pred_unnorm = pred_median * scaler + mean_scaler
     
     metrics = {}
+    
     for k, name in enumerate(feature_names):
-        mask_k = eval_points[:, :, k]
-        target_k = target_unnorm[:, :, k]
-        pred_k = pred_unnorm[:, :, k]
+        # FIX: Determine the correct index in the expanded tensor
+        if use_circular_encoding and feature_to_expanded is not None and name in feature_to_expanded:
+            # Get the indices in the expanded tensor (e.g., WVHT -> (3,))
+            expanded_indices = feature_to_expanded[name]
+            # For scalar metrics, we usually just take the first component or the variable itself.
+            # For circular vars (WDIR), calculating RMSE on sin/cos separately is standard in this pipeline.
+            # We use the first index found for the metric calculation.
+            tensor_idx = expanded_indices[0]
+        else:
+            tensor_idx = k
         
+        # Safety check for index out of bounds
+        if tensor_idx >= eval_points.shape[2]:
+            if debug:
+                print(f"WARNING: Feature {name} tensor_idx {tensor_idx} >= eval_points dim {eval_points.shape[2]}")
+            metrics[name] = {'rmse': 0.0, 'mae': 0.0, 'coverage_90': 0.0}
+            continue
+            
+        mask_k = eval_points[:, :, tensor_idx]
+        
+        # Check if we actually have data for this variable
         num_points = mask_k.sum()
+        
         if num_points > 0:
+            target_k = target_unnorm[:, :, tensor_idx]
+            pred_k = pred_unnorm[:, :, tensor_idx]
+            
             rmse = torch.sqrt(((pred_k - target_k) ** 2 * mask_k).sum() / num_points)
             mae = (torch.abs(pred_k - target_k) * mask_k).sum() / num_points
             
-            samples_k = samples[:, :, :, k]
+            # Coverage calculation
+            samples_k = samples[:, :, :, tensor_idx]
             lower = torch.quantile(samples_k, 0.05, dim=1)
             upper = torch.quantile(samples_k, 0.95, dim=1)
             
-            lower_unnorm = lower * scaler[k] + mean_scaler[k]
-            upper_unnorm = upper * scaler[k] + mean_scaler[k]
+            # Unnormalize bounds
+            lower_unnorm = lower * scaler[tensor_idx] + mean_scaler[tensor_idx]
+            upper_unnorm = upper * scaler[tensor_idx] + mean_scaler[tensor_idx]
             
             in_interval = ((target_k >= lower_unnorm) & (target_k <= upper_unnorm)).float()
             coverage = (in_interval * mask_k).sum() / num_points
@@ -298,7 +328,12 @@ def calc_per_variable_metrics(
                 'mae': mae.item(),
                 'coverage_90': coverage.item()
             }
+            
+            if debug:
+                print(f"DEBUG {name} (Idx {tensor_idx}): Found {num_points} points. RMSE={rmse.item():.4f}")
         else:
+            if debug:
+                print(f"WARNING: {name} has zero evaluation points!")
             metrics[name] = {'rmse': 0.0, 'mae': 0.0, 'coverage_90': 0.0}
     
     return metrics
@@ -317,7 +352,11 @@ def evaluate(
     foldername: str = "",
     feature_names: List[str] = FEATURE_NAMES,
     generate_visualizations: bool = True,
-    max_vis_samples: int = 5
+    max_vis_samples: int = 5,
+    use_circular_encoding: bool = False,
+    feature_to_expanded: Optional[Dict] = None,
+    debug: bool = False,
+    dataset_type: str = "NDBC1"
 ):
     """
     Comprehensive evaluation with all metrics.
@@ -346,6 +385,28 @@ def evaluate(
             for batch_no, test_batch in enumerate(it, start=1):
                 output = model.evaluate(test_batch, nsample)
                 samples, observed_data, target_mask, observed_mask, observed_time = output
+                
+                # DEBUG: Check ground truth values (first batch only)
+                if debug and batch_no == 1:
+                    print(f"\n[DEBUG Evaluation] First batch check:")
+                    print(f"  observed_data shape: {observed_data.shape}")
+                    print(f"  target_mask shape: {target_mask.shape}")
+                    print(f"  observed_mask shape: {observed_mask.shape}")
+                    if use_circular_encoding and 'WVHT' in feature_to_expanded:
+                        wvht_idx = feature_to_expanded['WVHT'][0]
+                        print(f"  WVHT index: {wvht_idx}")
+                        # Check normalized values
+                        wvht_norm = observed_data[0, :, wvht_idx]
+                        wvht_mask = target_mask[0, :, wvht_idx]
+                        print(f"  WVHT normalized (first sample): min={wvht_norm.min().item():.4f}, max={wvht_norm.max().item():.4f}, mean={wvht_norm.mean().item():.4f}")
+                        print(f"  WVHT target_mask sum: {wvht_mask.sum().item():.0f} (should be > 0)")
+                        # Check unnormalized
+                        wvht_unnorm = wvht_norm * scaler[wvht_idx] + mean_scaler[wvht_idx]
+                        print(f"  WVHT unnormalized: min={wvht_unnorm.min().item():.4f}, max={wvht_unnorm.max().item():.4f}, mean={wvht_unnorm.mean().item():.4f}")
+                        # Check where target_mask is 1
+                        target_indices = torch.where(wvht_mask > 0)[0]
+                        if len(target_indices) > 0:
+                            print(f"  WVHT target values (first 10): {wvht_unnorm[target_indices[:10]].tolist()}")
                 
                 samples = samples.permute(0, 1, 3, 2)
                 c_target = observed_data.permute(0, 2, 1)
@@ -409,7 +470,10 @@ def evaluate(
         
         per_var_metrics = calc_per_variable_metrics(
             all_target, all_samples, all_evalpoint,
-            mean_scaler, scaler, feature_names
+            mean_scaler, scaler, feature_names,
+            use_circular_encoding=use_circular_encoding,
+            feature_to_expanded=feature_to_expanded,
+            debug=debug
         )
         
         results = {
@@ -470,6 +534,126 @@ def evaluate(
                 }
                 json.dump(json_results, f, indent=2)
             
+            # DEBUG: Print numerical forecast analysis
+            if debug:
+                print("\n" + "="*80)
+                print("NUMERICAL FORECAST ANALYSIS")
+                print("="*80)
+                
+                # Get WVHT index
+                if use_circular_encoding and feature_to_expanded and 'WVHT' in feature_to_expanded:
+                    wvht_idx = feature_to_expanded['WVHT'][0]
+                else:
+                    wvht_idx = FEATURE_NAMES.index('WVHT') if 'WVHT' in FEATURE_NAMES else None
+                
+                if wvht_idx is not None and wvht_idx < all_target.shape[2]:
+                    # Unnormalize
+                    target_unnorm = all_target * scaler + mean_scaler
+                    samples_unnorm = all_samples * scaler + mean_scaler
+                    pred_median = samples_unnorm.median(dim=1).values
+                    pred_lower = torch.quantile(samples_unnorm, 0.05, dim=1)
+                    pred_upper = torch.quantile(samples_unnorm, 0.95, dim=1)
+                    
+                    # Extract WVHT data
+                    wvht_target = target_unnorm[:, :, wvht_idx]  # [N, T]
+                    wvht_pred = pred_median[:, :, wvht_idx]  # [N, T]
+                    wvht_lower = pred_lower[:, :, wvht_idx]  # [N, T]
+                    wvht_upper = pred_upper[:, :, wvht_idx]  # [N, T]
+                    wvht_eval = all_evalpoint[:, :, wvht_idx]  # [N, T]
+                    
+                    # Only analyze horizon (where eval_mask > 0)
+                    horizon_targets = []
+                    horizon_preds = []
+                    horizon_lowers = []
+                    horizon_uppers = []
+                    horizon_widths = []
+                    horizon_errors = []
+                    
+                    for n in range(min(5, len(wvht_target))):  # First 5 samples
+                        horizon_mask = wvht_eval[n] > 0
+                        if horizon_mask.sum() > 0:
+                            tgt_vals = wvht_target[n, horizon_mask].cpu().numpy()
+                            pred_vals = wvht_pred[n, horizon_mask].cpu().numpy()
+                            lower_vals = wvht_lower[n, horizon_mask].cpu().numpy()
+                            upper_vals = wvht_upper[n, horizon_mask].cpu().numpy()
+                            
+                            horizon_targets.extend(tgt_vals.tolist())
+                            horizon_preds.extend(pred_vals.tolist())
+                            horizon_lowers.extend(lower_vals.tolist())
+                            horizon_uppers.extend(upper_vals.tolist())
+                            horizon_widths.extend((upper_vals - lower_vals).tolist())
+                            horizon_errors.extend((pred_vals - tgt_vals).tolist())
+                    
+                    if horizon_targets:
+                        horizon_targets = np.array(horizon_targets)
+                        horizon_preds = np.array(horizon_preds)
+                        horizon_lowers = np.array(horizon_lowers)
+                        horizon_uppers = np.array(horizon_uppers)
+                        horizon_widths = np.array(horizon_widths)
+                        horizon_errors = np.array(horizon_errors)
+                        
+                        print(f"\nWVHT Forecast Statistics (Horizon Only, {len(horizon_targets)} points):")
+                        print(f"  Ground Truth:")
+                        print(f"    Mean: {horizon_targets.mean():.4f} m")
+                        print(f"    Std:  {horizon_targets.std():.4f} m")
+                        print(f"    Min:  {horizon_targets.min():.4f} m")
+                        print(f"    Max:  {horizon_targets.max():.4f} m")
+                        print(f"    Range: {horizon_targets.max() - horizon_targets.min():.4f} m")
+                        
+                        print(f"\n  Median Prediction:")
+                        print(f"    Mean: {horizon_preds.mean():.4f} m")
+                        print(f"    Std:  {horizon_preds.std():.4f} m")
+                        print(f"    Min:  {horizon_preds.min():.4f} m")
+                        print(f"    Max:  {horizon_preds.max():.4f} m")
+                        
+                        print(f"\n  Prediction Error (Pred - Truth):")
+                        print(f"    Mean Bias: {horizon_errors.mean():.4f} m (negative = underprediction)")
+                        print(f"    MAE:       {np.abs(horizon_errors).mean():.4f} m")
+                        print(f"    RMSE:      {np.sqrt((horizon_errors**2).mean()):.4f} m")
+                        print(f"    Max Error: {np.abs(horizon_errors).max():.4f} m")
+                        
+                        print(f"\n  90% Prediction Interval:")
+                        print(f"    Mean Width: {horizon_widths.mean():.4f} m")
+                        print(f"    Std Width:  {horizon_widths.std():.4f} m")
+                        print(f"    Min Width:  {horizon_widths.min():.4f} m")
+                        print(f"    Max Width:  {horizon_widths.max():.4f} m")
+                        print(f"    Width/Truth_Range Ratio: {horizon_widths.mean() / (horizon_targets.max() - horizon_targets.min()):.2f}x")
+                        
+                        # Coverage check
+                        in_interval = (horizon_targets >= horizon_lowers) & (horizon_targets <= horizon_uppers)
+                        coverage = in_interval.mean()
+                        print(f"\n  Coverage:")
+                        print(f"    90% Interval Coverage: {coverage*100:.2f}% ({in_interval.sum()}/{len(horizon_targets)})")
+                        
+                        # Sample-by-sample breakdown (first 3 samples)
+                        print(f"\n  Sample-by-Sample Breakdown (First 3):")
+                        sample_count = 0
+                        for n in range(min(3, len(wvht_target))):
+                            horizon_mask = wvht_eval[n] > 0
+                            if horizon_mask.sum() > 0:
+                                sample_count += 1
+                                tgt_vals = wvht_target[n, horizon_mask].cpu().numpy()
+                                pred_vals = wvht_pred[n, horizon_mask].cpu().numpy()
+                                lower_vals = wvht_lower[n, horizon_mask].cpu().numpy()
+                                upper_vals = wvht_upper[n, horizon_mask].cpu().numpy()
+                                
+                                print(f"\n    Sample {n+1} ({horizon_mask.sum().item()} horizon points):")
+                                print(f"      Truth:  mean={tgt_vals.mean():.4f}, std={tgt_vals.std():.4f}, range=[{tgt_vals.min():.4f}, {tgt_vals.max():.4f}]")
+                                print(f"      Pred:   mean={pred_vals.mean():.4f}, std={pred_vals.std():.4f}, range=[{pred_vals.min():.4f}, {pred_vals.max():.4f}]")
+                                print(f"      Error:  mean={np.mean(pred_vals - tgt_vals):.4f}, MAE={np.mean(np.abs(pred_vals - tgt_vals)):4f}")
+                                print(f"      Interval: mean_width={np.mean(upper_vals - lower_vals):.4f}, range=[{np.min(lower_vals):.4f}, {np.max(upper_vals):.4f}]")
+                                
+                                # Show first 5 and last 5 horizon points
+                                print(f"      First 5 horizon points:")
+                                for i in range(min(5, len(tgt_vals))):
+                                    print(f"        t={i}: truth={tgt_vals[i]:.4f}, pred={pred_vals[i]:.4f}, error={pred_vals[i]-tgt_vals[i]:.4f}, interval=[{lower_vals[i]:.4f}, {upper_vals[i]:.4f}]")
+                                if len(tgt_vals) > 5:
+                                    print(f"      Last 5 horizon points:")
+                                    for i in range(max(0, len(tgt_vals)-5), len(tgt_vals)):
+                                        print(f"        t={i}: truth={tgt_vals[i]:.4f}, pred={pred_vals[i]:.4f}, error={pred_vals[i]-tgt_vals[i]:.4f}, interval=[{lower_vals[i]:.4f}, {upper_vals[i]:.4f}]")
+                        
+                        print("\n" + "="*80)
+            
             if generate_visualizations:
                 vis_path = output_path / "visualizations"
                 vis_path.mkdir(exist_ok=True)
@@ -483,7 +667,11 @@ def evaluate(
                     scaler.cpu(),
                     vis_path,
                     feature_names,
-                    max_samples=max_vis_samples
+                    max_samples=max_vis_samples,
+                    dataset_type=dataset_type,
+                    use_circular_encoding=use_circular_encoding,
+                    feature_to_expanded=feature_to_expanded,
+                    debug=debug,
                 )
         
         return results
@@ -503,7 +691,11 @@ def generate_forecast_plots(
     output_path: Path,
     feature_names: List[str],
     max_samples: int = 5,
-    primary_var_idx: int = WVHT_INDEX
+    primary_var_idx: int = WVHT_INDEX,
+    dataset_type: str = "NDBC1",
+    use_circular_encoding: bool = False,
+    feature_to_expanded: Optional[Dict] = None,
+    debug: bool = False,
 ):
     """
     Generate high-resolution forecast visualization plots.
@@ -516,6 +708,22 @@ def generate_forecast_plots(
     """
     output_path = Path(output_path)
     
+    # DEBUG: Check dimensions match
+    if debug and len(target) > 0:
+        print(f"\n[DEBUG Plotting] Unnormalization check:")
+        print(f"  target shape: {target.shape}")
+        print(f"  scaler shape: {scaler.shape}, mean_scaler shape: {mean_scaler.shape}")
+        print(f"  samples shape: {samples.shape}")
+        if use_circular_encoding and 'WVHT' in feature_to_expanded:
+            wvht_idx = feature_to_expanded['WVHT'][0]
+            print(f"  WVHT index (expanded): {wvht_idx}")
+            print(f"  WVHT scaler: {scaler[wvht_idx].item():.4f}, mean: {mean_scaler[wvht_idx].item():.4f}")
+            # Check normalized vs unnormalized values
+            sample_norm = target[0, :, wvht_idx]
+            sample_unnorm = (target[0, :, wvht_idx] * scaler[wvht_idx] + mean_scaler[wvht_idx])
+            print(f"  WVHT normalized range: [{sample_norm.min().item():.4f}, {sample_norm.max().item():.4f}]")
+            print(f"  WVHT unnormalized range: [{sample_unnorm.min().item():.4f}, {sample_unnorm.max().item():.4f}]")
+    
     target_unnorm = target * scaler + mean_scaler
     samples_unnorm = samples * scaler + mean_scaler
     
@@ -526,18 +734,38 @@ def generate_forecast_plots(
     n_plots = min(max_samples, len(target))
     
     for sample_idx in range(n_plots):
-        for var_idx, var_name in enumerate(feature_names):
+        for var_name in feature_names:
+            # FIX: Correct Index Lookup
+            if use_circular_encoding and feature_to_expanded is not None and var_name in feature_to_expanded:
+                tensor_idx = feature_to_expanded[var_name][0]
+            else:
+                # Fallback if mapping missing or not using circular encoding
+                if var_name in FEATURE_NAMES:
+                    tensor_idx = FEATURE_NAMES.index(var_name)
+                else:
+                    continue
+            
+            # Skip if index is out of bounds (e.g. if features were removed)
+            if tensor_idx >= target.shape[2]:
+                continue
+            
+            # Check if this variable has ANY observed or target data to plot
+            # (Optimization: Don't generate empty plots for variables we didn't predict/observe)
+            obs_mask = observed_points[sample_idx, :, tensor_idx].numpy()
+            eval_mask = eval_points[sample_idx, :, tensor_idx].numpy()
+            
+            if np.sum(obs_mask) == 0 and np.sum(eval_mask) == 0:
+                continue
+            
             fig, ax = plt.subplots(figsize=(14, 6), dpi=150)
             
             L = target.shape[1]
             time_steps = np.arange(L)
             
-            target_var = target_unnorm[sample_idx, :, var_idx].numpy()
-            pred_med = pred_median[sample_idx, :, var_idx].numpy()
-            pred_lo = pred_lower[sample_idx, :, var_idx].numpy()
-            pred_hi = pred_upper[sample_idx, :, var_idx].numpy()
-            obs_mask = observed_points[sample_idx, :, var_idx].numpy()
-            eval_mask = eval_points[sample_idx, :, var_idx].numpy()
+            target_var = target_unnorm[sample_idx, :, tensor_idx].numpy()
+            pred_med = pred_median[sample_idx, :, tensor_idx].numpy()
+            pred_lo = pred_lower[sample_idx, :, tensor_idx].numpy()
+            pred_hi = pred_upper[sample_idx, :, tensor_idx].numpy()
             
             context_idx = np.where((obs_mask > 0) & (eval_mask == 0))[0]
             target_idx = np.where(eval_mask > 0)[0]
@@ -582,6 +810,21 @@ def generate_forecast_plots(
                 label='90% Prediction Interval',
                 zorder=1
             )
+
+            # Improve visualization: robust y-limits so small waves are not flattened by outliers
+            all_vals = np.concatenate([
+                target_var[np.isfinite(target_var)],
+                pred_lo[np.isfinite(pred_lo)],
+                pred_hi[np.isfinite(pred_hi)],
+            ])
+            if all_vals.size > 0:
+                q_low, q_high = np.quantile(all_vals, [0.01, 0.99])
+                pad = 0.1 * max(q_high - q_low, 1.0)
+                y_min = max(0.0, q_low - pad)
+                y_max = q_high + pad
+                if y_max <= y_min:
+                    y_max = y_min + 1.0
+                ax.set_ylim(y_min, y_max)
             
             if len(context_idx) > 0 and len(target_idx) > 0:
                 boundary = context_idx[-1] + 0.5
@@ -593,7 +836,11 @@ def generate_forecast_plots(
                     label='Context/Horizon Boundary'
                 )
             
-            ax.set_xlabel('Time Step (10-min intervals)', fontsize=12)
+            # TASK 3: Fix plotting x-axis label based on dataset type
+            if dataset_type == "NDBC2":
+                ax.set_xlabel('Time Step (hourly)', fontsize=12)
+            else:
+                ax.set_xlabel('Time Step (10-min intervals)', fontsize=12)
             ax.set_ylabel(f'{var_name} (Physical Units)', fontsize=12)
             ax.set_title(f'Wave Forecast: {var_name} - Sample {sample_idx + 1}', fontsize=14)
             ax.legend(loc='upper right', fontsize=10)

@@ -243,10 +243,21 @@ def run_imputation(args, config):
         task="imputation"
     )
     
+    # Get circular encoding info from dataset
+    train_dataset = train_loader.dataset
+    use_circular = getattr(train_dataset, 'use_circular_encoding', False)
+    feature_to_expanded = getattr(train_dataset, 'feature_to_expanded', None)
+    
+    # Determine target_dim based on circular encoding
+    if use_circular:
+        target_dim = train_dataset.target_dim
+    else:
+        target_dim = 9
+    
     # Initialize model
     era5_config = get_era5_config(args)
     model = get_model(
-        config, args.device, target_dim=9,
+        config, args.device, target_dim=target_dim,
         task="imputation",
         use_era5=args.use_era5,
         era5_config=era5_config
@@ -281,7 +292,11 @@ def run_imputation(args, config):
         scaler=scaler,
         mean_scaler=mean_scaler,
         foldername=foldername,
-        generate_visualizations=not args.no_vis
+        generate_visualizations=not args.no_vis,
+        use_circular_encoding=use_circular,
+        feature_to_expanded=feature_to_expanded,
+        debug=True,  # Enable debug prints
+        dataset_type=args.dataset_type
     )
     
     return foldername, metrics
@@ -332,10 +347,21 @@ def run_forecasting(args, config, horizon_hours=None):
         spatial_window_deg=args.spatial_window_deg
     )
     
+    # Get circular encoding info from dataset
+    train_dataset = train_loader.dataset
+    use_circular = getattr(train_dataset, 'use_circular_encoding', False)
+    feature_to_expanded = getattr(train_dataset, 'feature_to_expanded', None)
+    
+    # Determine target_dim based on circular encoding
+    if use_circular:
+        target_dim = train_dataset.target_dim
+    else:
+        target_dim = 9
+    
     # Initialize model
     era5_config = get_era5_config(args)
     model = get_model(
-        config, args.device, target_dim=9,
+        config, args.device, target_dim=target_dim,
         task="forecasting",
         use_era5=args.use_era5,
         era5_config=era5_config
@@ -364,6 +390,8 @@ def run_forecasting(args, config, horizon_hours=None):
     
     # Evaluate
     print(f"\nEvaluating forecasting model for {horizon_hours}h horizon...")
+    print(f"[DEBUG] Scaler shape: {scaler.shape}, Mean scaler shape: {mean_scaler.shape}")
+    print(f"[DEBUG] Dataset target_dim: {train_dataset.target_dim}, use_circular: {use_circular}")
     metrics = evaluate(
         model,
         test_loader,
@@ -371,7 +399,11 @@ def run_forecasting(args, config, horizon_hours=None):
         scaler=scaler,
         mean_scaler=mean_scaler,
         foldername=foldername,
-        generate_visualizations=not args.no_vis
+        generate_visualizations=not args.no_vis,
+        use_circular_encoding=use_circular,
+        feature_to_expanded=feature_to_expanded,
+        debug=True,  # Enable debug prints
+        dataset_type=args.dataset_type
     )
     
     return foldername, metrics

@@ -538,6 +538,46 @@ class CSDI_base(nn.Module):
         
         self.cfg_dropout_prob = config["model"].get("cfg_dropout_prob", 0.0)
         self.cfg_scale = config["model"].get("cfg_scale", 1.0)
+        
+        # Conditioning schedule
+        cond_config = config.get("conditioning", {})
+        self.cond_scale_type = cond_config.get("type", "none")  # "exp", "linear", "none"
+        self.cond_alpha = cond_config.get("alpha", 1.0)
+        self.cond_beta = cond_config.get("beta", 0.1)
+        self.cond_min = cond_config.get("min", 0.2)
+        
+        # Pre-compute conditioning scales for all diffusion steps
+        if self.cond_scale_type == "exp":
+            self.cond_scales = self.cond_alpha * np.exp(-self.cond_beta * np.arange(self.num_steps))
+            self.cond_scales = np.maximum(self.cond_scales, self.cond_min)
+        elif self.cond_scale_type == "linear":
+            self.cond_scales = np.linspace(1.0, self.cond_min, self.num_steps)
+        else:
+            self.cond_scales = np.ones(self.num_steps)
+        
+        self.cond_scales = torch.tensor(self.cond_scales, dtype=torch.float32).to(device)
+        
+        # Loss weighting
+        loss_config = config.get("loss", {})
+        self.use_loss_weights = loss_config.get("use_weights", False)
+        if self.use_loss_weights:
+            loss_weight_map = loss_config.get("weight_map", {})
+            # Default: WVHT weight = 5.0, others = 1.0
+            self.loss_weights = torch.ones(target_dim, device=device)
+            # Import here to avoid circular dependency
+            try:
+                from dataset_wave import FEATURE_NAMES
+            except ImportError:
+                # Fallback if import fails
+                FEATURE_NAMES = ['WDIR', 'WSPD', 'WVHT', 'DPD', 'APD', 'MWD', 'PRES', 'ATMP', 'DEWP']
+            for var_name, weight in loss_weight_map.items():
+                if var_name in FEATURE_NAMES:
+                    var_idx = FEATURE_NAMES.index(var_name)
+                    if var_idx < target_dim:
+                        self.loss_weights[var_idx] = weight
+            print(f"Loss weights: {dict(zip(FEATURE_NAMES[:target_dim], self.loss_weights.cpu().tolist()))}")
+        else:
+            self.loss_weights = None
 
     def time_embedding(self, pos: torch.Tensor, d_model: int = 128) -> torch.Tensor:
         """Sinusoidal time embedding."""
@@ -589,9 +629,10 @@ class CSDI_base(nn.Module):
     def get_side_info(
         self,
         observed_tp: torch.Tensor,
-        cond_mask: torch.Tensor
+        cond_mask: torch.Tensor,
+        diffusion_step: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        """Construct side information tensor."""
+        """Construct side information tensor with optional conditioning scale."""
         B, K, L = cond_mask.shape
         
         time_embed = self.time_embedding(observed_tp, self.emb_time_dim)
@@ -608,6 +649,13 @@ class CSDI_base(nn.Module):
         if not self.is_unconditional:
             side_mask = cond_mask.unsqueeze(1)
             side_info = torch.cat([side_info, side_mask], dim=1)
+        
+        # Apply conditioning scale if diffusion step provided
+        if diffusion_step is not None and self.cond_scale_type != "none":
+            # diffusion_step is shape [B], get corresponding scale
+            scale = self.cond_scales[diffusion_step]  # [B]
+            scale = scale.view(B, 1, 1, 1)  # Broadcast to side_info shape
+            side_info = side_info * scale
         
         return side_info
 
@@ -628,11 +676,12 @@ class CSDI_base(nn.Module):
         observed_data: torch.Tensor,
         cond_mask: torch.Tensor,
         observed_mask: torch.Tensor,
-        side_info: torch.Tensor,
+        side_info: Optional[torch.Tensor],
         is_train: int,
         set_t: int = -1,
         era5_context: Optional[torch.Tensor] = None,
-        era5_mask: Optional[torch.Tensor] = None
+        era5_mask: Optional[torch.Tensor] = None,
+        observed_tp: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Calculate diffusion loss."""
         B, K, L = observed_data.shape
@@ -641,6 +690,15 @@ class CSDI_base(nn.Module):
             t = (torch.ones(B) * set_t).long().to(self.device)
         else:
             t = torch.randint(0, self.num_steps, [B]).to(self.device)
+        
+        # Get side_info with conditioning scale applied if needed
+        if side_info is None and observed_tp is not None:
+            side_info = self.get_side_info(observed_tp, cond_mask, diffusion_step=t)
+        elif side_info is not None and self.cond_scale_type != "none":
+            # Apply conditioning scale to existing side_info
+            scale = self.cond_scales[t]  # [B]
+            scale = scale.view(B, 1, 1, 1)
+            side_info = side_info * scale
         
         current_alpha_bar = self.alphas_cumprod[t].reshape(B, 1, 1)
         noise = torch.randn_like(observed_data)
@@ -658,6 +716,12 @@ class CSDI_base(nn.Module):
         
         target_mask = observed_mask - cond_mask
         residual = (noise - predicted) * target_mask
+        
+        # Apply per-variable loss weights
+        if self.loss_weights is not None:
+            # loss_weights shape: [K]
+            residual = residual * self.loss_weights.view(1, K, 1)
+        
         num_eval = target_mask.sum()
         loss = (residual ** 2).sum() / (num_eval if num_eval > 0 else 1)
         
@@ -668,10 +732,11 @@ class CSDI_base(nn.Module):
         observed_data: torch.Tensor,
         cond_mask: torch.Tensor,
         observed_mask: torch.Tensor,
-        side_info: torch.Tensor,
+        side_info: Optional[torch.Tensor],
         is_train: int,
         era5_context: Optional[torch.Tensor] = None,
-        era5_mask: Optional[torch.Tensor] = None
+        era5_mask: Optional[torch.Tensor] = None,
+        observed_tp: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Calculate validation loss over all timesteps."""
         loss_sum = 0
@@ -680,7 +745,8 @@ class CSDI_base(nn.Module):
                 observed_data, cond_mask, observed_mask, side_info,
                 is_train, set_t=t,
                 era5_context=era5_context,
-                era5_mask=era5_mask
+                era5_mask=era5_mask,
+                observed_tp=observed_tp
             )
             loss_sum += loss.detach()
         return loss_sum / self.num_steps
@@ -795,13 +861,12 @@ class CSDI_base(nn.Module):
         else:
             cond_mask = self.get_randmask(observed_mask)
         
-        side_info = self.get_side_info(observed_tp, cond_mask)
-        
+        # side_info will be computed in calc_loss with proper conditioning scale
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
         
         return loss_func(
-            observed_data, cond_mask, observed_mask, side_info, is_train,
-            era5_context=era5_context, era5_mask=era5_mask
+            observed_data, cond_mask, observed_mask, None, is_train,
+            era5_context=era5_context, era5_mask=era5_mask, observed_tp=observed_tp
         )
 
     def evaluate(
@@ -911,7 +976,11 @@ class CSDI_Wave_Forecasting(CSDI_base):
             target_dim, config, device,
             use_era5=use_era5, era5_config=era5_config
         )
-        self.target_strategy = "test_pattern"
+        # FIX: Use config value instead of hardcoding "test_pattern"
+        # This allows mixed training during training, but still uses gt_mask during eval
+        # The parent class already reads config["model"]["target_strategy"], but we override it here
+        # So we need to respect the config value to enable mixed training
+        self.target_strategy = config["model"].get("target_strategy", "mix")
 
     def process_data(self, batch: Dict):
         """Process batch data for wave forecasting."""
@@ -937,13 +1006,13 @@ class CSDI_Wave_Forecasting(CSDI_base):
         )
 
     def forward(self, batch: Dict, is_train: int = 1) -> torch.Tensor:
-        """Forward pass for forecasting."""
+        """Forward pass for forecasting with mixed training support."""
         (
             observed_data,
             observed_mask,
             observed_tp,
             gt_mask,
-            _,
+            for_pattern_mask,
             _,
         ) = self.process_data(batch)
         
@@ -955,14 +1024,35 @@ class CSDI_Wave_Forecasting(CSDI_base):
                 era5_mask_raw = era5_mask_raw.to(self.device).float()
             era5_context, era5_mask = self.encode_era5(era5_data, era5_mask_raw)
         
-        cond_mask = gt_mask
-        side_info = self.get_side_info(observed_tp, cond_mask)
+        # FIX: Enable mixed training during training, but use gt_mask during validation/eval
+        if is_train == 0:
+            # Validation/eval: use gt_mask (pure forecasting)
+            cond_mask = gt_mask
+        elif self.target_strategy == "mix":
+            # Training with mix: randomly do interpolation OR forecasting
+            # This teaches the model smoothness via interpolation tasks
+            rand_mask = self.get_randmask(observed_mask)
+            cond_mask = observed_mask.clone()
+            for i in range(len(cond_mask)):
+                mask_choice = np.random.rand()
+                if mask_choice > 0.5:
+                    # 50% chance: random interpolation task (fills gaps in context/horizon)
+                    # This is the same as imputation - teaches smoothness
+                    cond_mask[i] = rand_mask[i]
+                else:
+                    # 50% chance: forecasting task (context only, like gt_mask)
+                    # But we still use gt_mask structure to ensure horizon is masked
+                    cond_mask[i] = gt_mask[i]
+        else:
+            # Other strategies: use gt_mask (pure forecasting)
+            cond_mask = gt_mask
         
+        # side_info will be computed in calc_loss with proper conditioning scale
         loss_func = self.calc_loss if is_train == 1 else self.calc_loss_valid
         
         return loss_func(
-            observed_data, cond_mask, observed_mask, side_info, is_train,
-            era5_context=era5_context, era5_mask=era5_mask
+            observed_data, cond_mask, observed_mask, None, is_train,
+            era5_context=era5_context, era5_mask=era5_mask, observed_tp=observed_tp
         )
 
 
