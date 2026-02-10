@@ -539,6 +539,9 @@ class CSDI_base(nn.Module):
         self.cfg_dropout_prob = config["model"].get("cfg_dropout_prob", 0.0)
         self.cfg_scale = config["model"].get("cfg_scale", 1.0)
         
+        # Temperature scaling for reducing over-dispersion (tighter intervals)
+        self.temperature = config_diff.get("temperature", 1.0)
+        
         # Conditioning schedule
         cond_config = config.get("conditioning", {})
         self.cond_scale_type = cond_config.get("type", "none")  # "exp", "linear", "none"
@@ -825,6 +828,8 @@ class CSDI_base(nn.Module):
                 
                 if t > 0:
                     sigma = self.posterior_variance[t].view(1, 1, 1) ** 0.5
+                    # Apply temperature scaling to reduce over-dispersion
+                    sigma = sigma * self.temperature
                     noise = torch.randn_like(x)
                     x = mean + sigma * noise
                 else:
